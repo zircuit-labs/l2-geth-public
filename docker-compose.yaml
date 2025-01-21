@@ -1,0 +1,35 @@
+services:
+  # This assumes the existance of image l2geth-ccc:latest locally
+  geth:
+    image: l2geth-ccc:latest
+    ports:
+      - "8545:8545"
+      - "8060:6060"
+    environment:
+      - ENFORCE_CCC_REJECTION=enable
+      - USE_GETH_FOR_FAILURE=enable
+    command: >
+      --dev
+      --datadir=/data
+      --verbosity=3
+      --http
+      --http.corsdomain="*"
+      --http.vhosts="*"
+      --http.addr=0.0.0.0
+      --http.port=8545
+      --http.api=eth,net,web3,personal,txpool,miner,debug,engine,scroll
+      --ws
+      --ws.addr=0.0.0.0
+      --ws.port=8546
+      --ws.origins="*"
+      --ws.api=debug,eth,txpool,net,engine
+      --syncmode=full
+      --nodiscover
+      --maxpeers=0
+      --networkid=19763
+      --rpc.allow-unprotected-txs
+      --gcmode=archive
+      --metrics
+      --metrics.addr=0.0.0.0
+      --metrics.port=6060
+      --allow-insecure-unlock

@@ -1,0 +1,40 @@
+[package]
+name = "zkp"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib"]
+
+[patch."https+git://github.com/privacy-scaling-explorations/halo2.git"]
+halo2_proofs = { git = "https://github.com/zircuit-labs/legacy-zkevm-circuits.git", rev = "3f91bb7b4d92b3c256ed0de47d12613b000ed4a2" }
+[patch."https://github.com/privacy-scaling-explorations/poseidon.git"]
+poseidon = { git = "https://github.com/scroll-tech/poseidon.git", branch = "scroll-dev-0220" }
+[patch."https://github.com/privacy-scaling-explorations/halo2curves.git"]
+halo2curves = { git = "https://github.com/scroll-tech/halo2curves.git", branch = "0.3.1-derive-serde" }
+[patch."https://github.com/privacy-scaling-explorations/halo2wrong.git"]
+maingate = { git = "https://github.com/scroll-tech/halo2wrong", branch = "halo2-ecc-snark-verifier-0323" }
+
+[dependencies]
+capacity_checker = { git = "https://github.com/zircuit-labs/zkr-modular-prover.git", rev = "43174a05e610abb41cafab6f312675d96e0a17c4" }
+traits = { git = "https://github.com/zircuit-labs/zkr-modular-prover.git", rev = "43174a05e610abb41cafab6f312675d96e0a17c4" }
+halo2curves = { git = 'https://github.com/scroll-tech/halo2curves.git', branch = "0.3.1-derive-serde" }
+
+tokio = { version = "1.32", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.9.0"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0.66"
+libc = "0.2"
+once_cell = "1.19.0"
+
+
+[profile.test]
+opt-level = 3
+debug-assertions = true
+
+[profile.release]
+opt-level = 3
