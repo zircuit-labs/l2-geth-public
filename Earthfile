@@ -48,8 +48,6 @@ GO_BUILD_DEPENDENCIES_CMD:
     WORKDIR /src
     COPY ./go.mod /src
     COPY ./go.sum /src
-    RUN --secret GITHUB_TOKEN git config --global --replace-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/zircuit-labs/".insteadOf "https://github.com/zircuit-labs/"
-    ENV GOPRIVATE=github.com/zircuit-labs
     RUN go mod download
     RUN go mod verify
     RUN go install github.com/mfridman/tparse@latest
