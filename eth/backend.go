@@ -1,0 +1,818 @@
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+// Package eth implements the Ethereum protocol.
+package eth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"runtime"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/zircuit-labs/l2-geth/accounts"
+	"github.com/zircuit-labs/l2-geth/common"
+	"github.com/zircuit-labs/l2-geth/common/hexutil"
+	"github.com/zircuit-labs/l2-geth/consensus"
+	"github.com/zircuit-labs/l2-geth/consensus/clique"
+	"github.com/zircuit-labs/l2-geth/core"
+	"github.com/zircuit-labs/l2-geth/core/filtermaps"
+	"github.com/zircuit-labs/l2-geth/core/rawdb"
+	slsCommon "github.com/zircuit-labs/l2-geth/core/sls-common"
+	slsCommonDetector "github.com/zircuit-labs/l2-geth/core/sls-common/detector"
+	metricsCommon "github.com/zircuit-labs/l2-geth/core/sls-common/metrics"
+	sls "github.com/zircuit-labs/l2-geth/core/sls-public"
+	"github.com/zircuit-labs/l2-geth/core/sls-public/detector"
+	metrics "github.com/zircuit-labs/l2-geth/core/sls-public/metrics"
+	"github.com/zircuit-labs/l2-geth/core/sls-public/storage"
+	"github.com/zircuit-labs/l2-geth/core/sls-public/trustverifier"
+	"github.com/zircuit-labs/l2-geth/core/state/pruner"
+	"github.com/zircuit-labs/l2-geth/core/txpool"
+	"github.com/zircuit-labs/l2-geth/core/txpool/blobpool"
+	"github.com/zircuit-labs/l2-geth/core/txpool/legacypool"
+	"github.com/zircuit-labs/l2-geth/core/types"
+	"github.com/zircuit-labs/l2-geth/core/vm"
+	"github.com/zircuit-labs/l2-geth/eth/downloader"
+	"github.com/zircuit-labs/l2-geth/eth/ethconfig"
+	"github.com/zircuit-labs/l2-geth/eth/gasprice"
+	"github.com/zircuit-labs/l2-geth/eth/protocols/eth"
+	"github.com/zircuit-labs/l2-geth/eth/protocols/snap"
+	"github.com/zircuit-labs/l2-geth/ethdb"
+	"github.com/zircuit-labs/l2-geth/event"
+	"github.com/zircuit-labs/l2-geth/internal/ethapi"
+	"github.com/zircuit-labs/l2-geth/internal/shutdowncheck"
+	"github.com/zircuit-labs/l2-geth/log"
+	"github.com/zircuit-labs/l2-geth/miner"
+	"github.com/zircuit-labs/l2-geth/node"
+	"github.com/zircuit-labs/l2-geth/p2p"
+	"github.com/zircuit-labs/l2-geth/p2p/dnsdisc"
+	"github.com/zircuit-labs/l2-geth/p2p/enode"
+	"github.com/zircuit-labs/l2-geth/params"
+	"github.com/zircuit-labs/l2-geth/rlp"
+	"github.com/zircuit-labs/l2-geth/rpc"
+	"github.com/zircuit-labs/zkr-go-common/xerrors/stacktrace"
+)
+
+const (
+	// This is the fairness knob for the discovery mixer. When looking for peers, we'll
+	// wait this long for a single source of candidates before moving on and trying other
+	// sources. If this timeout expires, the source will be skipped in this round, but it
+	// will continue to fetch in the background and will have a chance with a new timeout
+	// in the next rounds, giving it overall more time but a proportionally smaller share.
+	// We expect a normal source to produce ~10 candidates per second.
+	discmixTimeout = 100 * time.Millisecond
+
+	// discoveryPrefetchBuffer is the number of peers to pre-fetch from a discovery
+	// source. It is useful to avoid the negative effects of potential longer timeouts
+	// in the discovery, keeping dial progress while waiting for the next batch of
+	// candidates.
+	discoveryPrefetchBuffer = 32
+
+	// maxParallelENRRequests is the maximum number of parallel ENR requests that can be
+	// performed by a disc/v4 source.
+	maxParallelENRRequests = 16
+)
+
+// Config contains the configuration options of the ETH protocol.
+// Deprecated: use ethconfig.Config instead.
+type Config = ethconfig.Config
+
+// Ethereum implements the Ethereum full node service.
+type Ethereum struct {
+	config *ethconfig.Config
+
+	// Handlers
+	txPool *txpool.TxPool
+
+	blockchain *core.BlockChain
+	handler    *handler
+	discmix    *enode.FairMix
+	dropper    *dropper
+
+	merger *consensus.Merger
+
+	seqRPCService        *rpc.Client
+	historicalRPCService *rpc.Client
+
+	// DB interfaces
+	chainDb ethdb.Database // Block chain database
+
+	eventMux       *event.TypeMux
+	engine         consensus.Engine
+	accountManager *accounts.Manager
+
+	filterMaps      *filtermaps.FilterMaps
+	closeFilterMaps chan chan struct{}
+
+	APIBackend *EthAPIBackend
+
+	slsManager *sls.Manager
+
+	miner     *miner.Miner
+	gasPrice  *big.Int
+	etherbase common.Address
+
+	networkID     uint64
+	netRPCService *ethapi.NetAPI
+
+	p2pServer *p2p.Server
+
+	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
+
+	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
+
+	nodeCloser func() error
+
+	slsCloser func()
+}
+
+// New creates a new Ethereum object (including the
+// initialisation of the common Ethereum object)
+func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
+	// Ensure configuration values are compatible and sane
+	if !config.SyncMode.IsValid() {
+		return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
+	}
+	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Cmp(common.Big0) <= 0 {
+		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
+		config.Miner.GasPrice = new(big.Int).Set(ethconfig.Defaults.Miner.GasPrice)
+	}
+	if config.NoPruning && config.TrieDirtyCache > 0 {
+		if config.SnapshotCache > 0 {
+			config.TrieCleanCache += config.TrieDirtyCache * 3 / 5
+			config.SnapshotCache += config.TrieDirtyCache * 2 / 5
+		} else {
+			config.TrieCleanCache += config.TrieDirtyCache
+		}
+		config.TrieDirtyCache = 0
+	}
+	log.Info("Allocated trie memory caches", "clean", common.StorageSize(config.TrieCleanCache)*1024*1024, "dirty", common.StorageSize(config.TrieDirtyCache)*1024*1024)
+
+	// Assemble the Ethereum object
+	chainDb, err := stack.OpenDatabaseWithFreezer("chaindata", config.DatabaseCache, config.DatabaseHandles, config.DatabaseFreezer, "eth/db/chaindata/", false)
+	if err != nil {
+		return nil, err
+	}
+	scheme, err := rawdb.ParseStateScheme(config.StateScheme, chainDb)
+	if err != nil {
+		return nil, err
+	}
+	// Try to recover offline state pruning only in hash-based.
+	if scheme == rawdb.HashScheme {
+		if err := pruner.RecoverPruning(stack.ResolvePath(""), chainDb); err != nil {
+			log.Error("Failed to recover state", "error", err)
+		}
+	}
+	// Transfer mining-related config to the ethash config.
+	chainConfig, err := core.LoadChainConfig(chainDb, config.Genesis)
+	if err != nil {
+		return nil, err
+	}
+
+	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
+	if err != nil {
+		return nil, err
+	}
+	networkID := config.NetworkId
+	if networkID == 0 {
+		networkID = chainConfig.ChainID.Uint64()
+	}
+	eth := &Ethereum{
+		config:          config,
+		merger:          consensus.NewMerger(chainDb),
+		chainDb:         chainDb,
+		eventMux:        stack.EventMux(),
+		accountManager:  stack.AccountManager(),
+		engine:          engine,
+		networkID:       networkID,
+		gasPrice:        config.Miner.GasPrice,
+		etherbase:       config.Miner.Etherbase,
+		p2pServer:       stack.Server(),
+		discmix:         enode.NewFairMix(discmixTimeout),
+		shutdownTracker: shutdowncheck.NewShutdownTracker(chainDb),
+		nodeCloser:      stack.Close,
+	}
+	bcVersion := rawdb.ReadDatabaseVersion(chainDb)
+	dbVer := "<nil>"
+	if bcVersion != nil {
+		dbVer = fmt.Sprintf("%d", *bcVersion)
+	}
+
+	if !config.SkipBcVersionCheck {
+		if bcVersion != nil && *bcVersion > core.BlockChainVersion {
+			return nil, fmt.Errorf("database version is v%d, Geth %s only supports v%d", *bcVersion, params.VersionWithMeta, core.BlockChainVersion)
+		} else if bcVersion == nil || *bcVersion < core.BlockChainVersion {
+			if bcVersion != nil { // only print warning on upgrade, not on init
+				log.Warn("Upgrade blockchain database version", "from", dbVer, "to", core.BlockChainVersion)
+			}
+			rawdb.WriteDatabaseVersion(chainDb, core.BlockChainVersion)
+		}
+	}
+	options := &core.BlockChainConfig{
+		TrieCleanLimit:   config.TrieCleanCache,
+		NoPrefetch:       config.NoPrefetch,
+		TrieDirtyLimit:   config.TrieDirtyCache,
+		ArchiveMode:      config.NoPruning,
+		TrieTimeLimit:    config.TrieTimeout,
+		SnapshotLimit:    config.SnapshotCache,
+		Preimages:        config.Preimages,
+		StateHistory:     config.StateHistory,
+		StateScheme:      scheme,
+		ChainHistoryMode: config.HistoryMode,
+		TxLookupLimit:    int64(min(config.TransactionHistory, math.MaxInt64)),
+		VmConfig: vm.Config{
+			EnablePreimageRecording: config.EnablePreimageRecording,
+		},
+		// Enables file journaling for the trie database. The journal files will be stored
+		// within the data directory. The corresponding paths will be either:
+		// - DATADIR/triedb/merkle.journal
+		// - DATADIR/triedb/verkle.journal
+		TrieJournalDirectory: stack.ResolvePath("triedb"),
+	}
+
+	// Override the chain config with provided settings.
+	var overrides core.ChainOverrides
+	if config.OverrideCancun != nil {
+		overrides.OverrideCancun = config.OverrideCancun
+	}
+	if config.OverrideVerkle != nil {
+		overrides.OverrideVerkle = config.OverrideVerkle
+	}
+	if config.OverrideOptimismCanyon != nil {
+		overrides.OverrideOptimismCanyon = config.OverrideOptimismCanyon
+	}
+	if config.OverrideOptimismEcotone != nil {
+		overrides.OverrideOptimismEcotone = config.OverrideOptimismEcotone
+	}
+	if config.OverrideOptimismHolocene != nil {
+		overrides.OverrideOptimismHolocene = config.OverrideOptimismHolocene
+	}
+	if config.OverrideZircuitAlfie != nil {
+		overrides.OverrideZircuitAlfie = config.OverrideZircuitAlfie
+	}
+	if config.OverrideMonoFee != nil {
+		overrides.OverrideMonoFee = config.OverrideMonoFee
+	}
+	options.Overrides = &overrides
+
+	eth.blockchain, err = core.NewBlockChain(chainDb, config.Genesis, eth.engine, options)
+	if err != nil {
+		return nil, err
+	}
+
+	if chainConfig := eth.blockchain.Config(); chainConfig.Optimism != nil { // config.Genesis.Config.ChainID cannot be used because it's based on CLI flags only, thus default to mainnet L1
+		config.NetworkId = chainConfig.ChainID.Uint64() // optimism defaults eth network ID to chain ID
+		eth.networkID = config.NetworkId
+	}
+	log.Info("Initialising Ethereum protocol", "network", config.NetworkId, "dbversion", dbVer)
+
+	if eth.blockchain.Config().Optimism != nil { // Optimism Bedrock depends on Merge functionality
+		eth.merger.FinalizePoS()
+	}
+
+	// Initialize filtermaps log index.
+	fmConfig := filtermaps.Config{
+		History:        config.LogHistory,
+		Disabled:       config.LogNoHistory,
+		ExportFileName: config.LogExportCheckpoints,
+		HashScheme:     scheme == rawdb.HashScheme,
+	}
+	chainView := eth.newChainView(eth.blockchain.CurrentBlock())
+	historyCutoff, _ := eth.blockchain.HistoryPruningCutoff()
+	var finalBlock uint64
+	if fb := eth.blockchain.CurrentFinalBlock(); fb != nil {
+		finalBlock = fb.Number.Uint64()
+	}
+	filterMaps, err := filtermaps.NewFilterMaps(chainDb, chainView, historyCutoff, finalBlock, filtermaps.DefaultParams, fmConfig)
+	if err != nil {
+		return nil, err
+	}
+	eth.filterMaps = filterMaps
+	eth.closeFilterMaps = make(chan chan struct{})
+
+	if config.BlobPool.Datadir != "" {
+		config.BlobPool.Datadir = stack.ResolvePath(config.BlobPool.Datadir)
+	}
+
+	if config.TxPool.Journal != "" {
+		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
+	}
+	ctx := context.Background()
+
+	// ensure SLS reader is already initialized
+	refreshableGetter := sls.GetterOrStatic(config.SLSConfig.Refreshable)
+	legacyPool := legacypool.New(config.TxPool, eth.blockchain, config.SLSConfig, refreshableGetter)
+	metricsCollector, err := metrics.NewCollector(prometheus.DefaultRegisterer)
+	if err != nil {
+		return nil, err
+	}
+	if config.SLSConfig.IsEnabled() {
+		eth.slsManager, err = createSLSManager(ctx, config, chainConfig, refreshableGetter, metricsCollector, eth.blockchain)
+		if err != nil {
+			return nil, err
+		}
+
+		err = legacyPool.AddDetectorManager(eth.slsManager)
+		if err != nil {
+			return nil, err
+		}
+
+		err = legacyPool.WithDetectors(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	txPools := []txpool.SubPool{legacyPool}
+	if !eth.BlockChain().Config().IsOptimism() {
+		blobPool := blobpool.New(config.BlobPool, eth.blockchain, legacyPool.HasPendingAuth)
+		txPools = append(txPools, blobPool)
+	}
+	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, txPools)
+	if err != nil {
+		return nil, err
+	}
+
+	// Permit the downloader to use the trie cache allowance during fast sync
+	cacheLimit := options.TrieCleanLimit + options.TrieDirtyLimit + options.SnapshotLimit
+	if eth.handler, err = newHandler(&handlerConfig{
+		NodeID:         eth.p2pServer.Self().ID(),
+		Database:       chainDb,
+		Chain:          eth.blockchain,
+		TxPool:         eth.txPool,
+		Network:        networkID,
+		Sync:           config.SyncMode,
+		BloomCache:     uint64(cacheLimit),
+		EventMux:       eth.eventMux,
+		RequiredBlocks: config.RequiredBlocks,
+		NoTxGossip:     config.RollupDisableTxPoolGossip,
+	}); err != nil {
+		return nil, err
+	}
+
+	eth.dropper = newDropper(eth.p2pServer.MaxDialedConns(), eth.p2pServer.MaxInboundConns())
+
+	eth.miner = miner.New(eth, &config.Miner, eth.engine, refreshableGetter)
+	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+	if config.SLSConfig.IsEnabled() {
+		ctx := context.Background()
+		txClassifier := sls.NewTransactionClassifier()
+		slsDatabase, err := storage.NewStorage(ctx, config.SLSConfig)
+		if err != nil {
+			return nil, err
+		}
+		signer := types.LatestSigner(chainConfig)
+
+		worker, err := sls.NewWorker(slsDatabase, config.SLSConfig, refreshableGetter, eth.slsManager, txClassifier, eth.TxPool(), signer, metricsCollector)
+		if err != nil {
+			return nil, err
+		}
+
+		eth.miner.AddSLSWorker(worker)
+	}
+
+	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, config.RollupDisableTxPoolAdmission, eth, nil}
+	if eth.APIBackend.allowUnprotectedTxs {
+		log.Info("Unprotected transactions allowed")
+	}
+
+	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, config.GPO, config.Miner.GasPrice)
+
+	if config.RollupSequencerHTTP != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		client, err := rpc.DialContext(ctx, config.RollupSequencerHTTP)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		eth.seqRPCService = client
+	}
+
+	if config.RollupHistoricalRPC != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), config.RollupHistoricalRPCTimeout)
+		client, err := rpc.DialContext(ctx, config.RollupHistoricalRPC)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		eth.historicalRPCService = client
+	}
+
+	// Start the RPC service
+	eth.netRPCService = ethapi.NewNetAPI(eth.p2pServer, networkID)
+
+	apis, err := eth.APIs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Register the backend on the node
+	stack.RegisterAPIs(apis)
+	stack.RegisterProtocols(eth.Protocols())
+	stack.RegisterLifecycle(eth)
+
+	// Successful startup; push a marker and check previous unclean shutdowns.
+	eth.shutdownTracker.MarkStartup()
+
+	return eth, nil
+}
+
+func createSLSManager(ctx context.Context, config *ethconfig.Config, chainConfig *params.ChainConfig, refreshableGetter sls.RefreshableGetter, metricsCollector metricsCommon.Metrics, blockchain *core.BlockChain) (*sls.Manager, error) {
+	slsDatabase, err := storage.NewStorage(ctx, config.SLSConfig)
+	if err != nil {
+		log.Warn("Can't connect to SLS storage", "err", err)
+		return nil, err
+	}
+
+	signer := types.LatestSigner(chainConfig)
+
+	detectorFactory := detector.NewFactory(slsCommonDetector.Dependencies[sls.Config, sls.RefreshableGetter]{
+		SLSConfig:             &config.SLSConfig,
+		GetRefreshableConfigs: refreshableGetter,
+		SLSDatabase:           slsDatabase,
+		Signer:                signer,
+		Blockchain:            blockchain,
+	})
+
+	refreshInterval := sls.DefaultDetectorStatusRefreshInterval
+	if config.SLSConfig.DetectorStatusRefreshInterval > 0 {
+		refreshInterval = time.Duration(config.SLSConfig.DetectorStatusRefreshInterval)
+	}
+
+	detectorRegistry := sls.NewDetectorRegistry(detectorFactory, slsDatabase, refreshInterval)
+	if err := detectorRegistry.Start(ctx); err != nil {
+		log.Error("Failed to start detector registry", "err", err)
+		return nil, stacktrace.Wrap(err)
+	}
+
+	trustVerifiers := []slsCommon.TrustVerifier{
+		trustverifier.NewSystemTransactions(signer),
+		trustverifier.NewTrustList(signer, slsDatabase),
+	}
+
+	return sls.NewManager(refreshableGetter, detectorRegistry, trustVerifiers, slsDatabase, metricsCollector), nil
+}
+
+func (s *Ethereum) SLSConfig() sls.Config {
+	return s.config.SLSConfig
+}
+
+func makeExtraData(extra []byte) []byte {
+	if len(extra) == 0 {
+		// create default extradata
+		extra, _ = rlp.EncodeToBytes([]any{
+			params.VersionWithMeta,
+			runtime.Version(),
+			runtime.GOOS,
+		})
+	}
+	if uint64(len(extra)) > params.MaximumExtraDataSize {
+		log.Warn("Miner extra data exceed limit", "extra", hexutil.Bytes(extra), "limit", params.MaximumExtraDataSize)
+		extra = nil
+	}
+	return extra
+}
+
+// APIs return the collection of RPC services the ethereum package offers.
+// NOTE, some of these services probably need to be moved to somewhere else.
+func (s *Ethereum) APIs() ([]rpc.API, error) {
+	apis, err := ethapi.GetAPIs(s.APIBackend, s.config.SLSConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Append any APIs exposed explicitly by the consensus engine
+	apis = append(apis, s.engine.APIs(s.BlockChain())...)
+
+	// Append all the local APIs and return
+	return append(apis, []rpc.API{
+		{
+			Namespace: "eth",
+			Service:   NewEthereumAPI(s),
+		}, {
+			Namespace: "miner",
+			Service:   NewMinerAPI(s),
+		}, {
+			Namespace: "eth",
+			Service:   downloader.NewDownloaderAPI(s.handler.downloader, s.blockchain, s.eventMux),
+		}, {
+			Namespace: "admin",
+			Service:   NewAdminAPI(s),
+		}, {
+			Namespace: "debug",
+			Service:   NewDebugAPI(s),
+		}, {
+			Namespace: "net",
+			Service:   s.netRPCService,
+		},
+	}...), nil
+}
+
+func (s *Ethereum) ResetWithGenesisBlock(gb *types.Block) {
+	s.blockchain.ResetWithGenesisBlock(gb)
+}
+
+func (s *Ethereum) Etherbase() (eb common.Address, err error) {
+	s.lock.RLock()
+	etherbase := s.etherbase
+	s.lock.RUnlock()
+
+	if etherbase != (common.Address{}) {
+		return etherbase, nil
+	}
+	return common.Address{}, errors.New("etherbase must be explicitly specified")
+}
+
+// isLocalBlock checks whether the specified block is mined
+// by local miner accounts.
+//
+// We regard two types of accounts as local miner account: etherbase
+// and accounts specified via `txpool.locals` flag.
+func (s *Ethereum) isLocalBlock(header *types.Header) bool {
+	author, err := s.engine.Author(header)
+	if err != nil {
+		log.Warn("Failed to retrieve block author", "number", header.Number.Uint64(), "hash", header.Hash(), "err", err)
+		return false
+	}
+	// Check whether the given address is etherbase.
+	s.lock.RLock()
+	etherbase := s.etherbase
+	s.lock.RUnlock()
+	if author == etherbase {
+		return true
+	}
+	// Check whether the given address is specified by `txpool.local`
+	// CLI flag.
+	return slices.Contains(s.config.TxPool.Locals, author)
+}
+
+// shouldPreserve checks whether we should preserve the given block
+// during the chain reorg depending on whether the author of block
+// is a local account.
+func (s *Ethereum) shouldPreserve(header *types.Header) bool {
+	// The reason we need to disable the self-reorg preserving for clique
+	// is it can be probable to introduce a deadlock.
+	//
+	// e.g. If there are 7 available signers
+	//
+	// r1   A
+	// r2     B
+	// r3       C
+	// r4         D
+	// r5   A      [X] F G
+	// r6    [X]
+	//
+	// In the round5, the in-turn signer E is offline, so the worst case
+	// is A, F and G sign the block of round5 and reject the block of opponents
+	// and in the round6, the last available signer B is offline, the whole
+	// network is stuck.
+	if _, ok := s.engine.(*clique.Clique); ok {
+		return false
+	}
+	return s.isLocalBlock(header)
+}
+
+func (s *Ethereum) Miner() *miner.Miner { return s.miner }
+
+func (s *Ethereum) AccountManager() *accounts.Manager  { return s.accountManager }
+func (s *Ethereum) BlockChain() *core.BlockChain       { return s.blockchain }
+func (s *Ethereum) TxPool() *txpool.TxPool             { return s.txPool }
+func (s *Ethereum) EventMux() *event.TypeMux           { return s.eventMux }
+func (s *Ethereum) Engine() consensus.Engine           { return s.engine }
+func (s *Ethereum) ChainDb() ethdb.Database            { return s.chainDb }
+func (s *Ethereum) IsListening() bool                  { return true } // Always listening
+func (s *Ethereum) Downloader() *downloader.Downloader { return s.handler.downloader }
+func (s *Ethereum) Synced() bool                       { return s.handler.synced.Load() }
+func (s *Ethereum) SetSynced()                         { s.handler.enableSyncedFeatures() }
+func (s *Ethereum) ArchiveMode() bool                  { return s.config.NoPruning }
+func (s *Ethereum) Merger() *consensus.Merger          { return s.merger }
+
+// Protocols returns all the currently configured
+// network protocols to start.
+func (s *Ethereum) Protocols() []p2p.Protocol {
+	protos := eth.MakeProtocols((*ethHandler)(s.handler), s.networkID, s.discmix)
+	if s.config.SnapshotCache > 0 {
+		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler))...)
+	}
+	return protos
+}
+
+// Start implements node.Lifecycle, starting all internal goroutines needed by the
+// Ethereum protocol implementation.
+func (s *Ethereum) Start() error {
+	if err := s.setupDiscovery(); err != nil {
+		return err
+	}
+
+	// Regularly update shutdown marker
+	s.shutdownTracker.Start()
+
+	// Start the networking layer
+	s.handler.Start(s.p2pServer.MaxPeers)
+
+	// Start the connection manager
+	s.dropper.Start(s.p2pServer, func() bool { return !s.Synced() })
+
+	// start log indexer
+	s.filterMaps.Start()
+	go s.updateFilterMapsHeads()
+	return nil
+}
+
+func (s *Ethereum) newChainView(head *types.Header) *filtermaps.ChainView {
+	if head == nil {
+		return nil
+	}
+	return filtermaps.NewChainView(s.blockchain, head.Number.Uint64(), head.Hash())
+}
+
+func (s *Ethereum) updateFilterMapsHeads() {
+	headEventCh := make(chan core.ChainEvent, 10)
+	blockProcCh := make(chan bool, 10)
+	sub := s.blockchain.SubscribeChainEvent(headEventCh)
+	sub2 := s.blockchain.SubscribeBlockProcessingEvent(blockProcCh)
+	defer func() {
+		sub.Unsubscribe()
+		sub2.Unsubscribe()
+		for {
+			select {
+			case <-headEventCh:
+			case <-blockProcCh:
+			default:
+				return
+			}
+		}
+	}()
+
+	var head *types.Header
+	setHead := func(newHead *types.Header) {
+		if newHead == nil {
+			return
+		}
+		if head == nil || newHead.Hash() != head.Hash() {
+			head = newHead
+			chainView := s.newChainView(head)
+			if chainView == nil {
+				log.Warn("FilterMaps chain view is nil, not updating")
+				return
+			}
+			historyCutoff, _ := s.blockchain.HistoryPruningCutoff()
+			var finalBlock uint64
+			if fb := s.blockchain.CurrentFinalBlock(); fb != nil {
+				finalBlock = fb.Number.Uint64()
+			}
+			s.filterMaps.SetTarget(chainView, historyCutoff, finalBlock)
+		}
+	}
+	setHead(s.blockchain.CurrentBlock())
+
+	for {
+		select {
+		case ev := <-headEventCh:
+			setHead(ev.Header)
+		case blockProc := <-blockProcCh:
+			s.filterMaps.SetBlockProcessing(blockProc)
+		case <-time.After(time.Second * 10):
+			setHead(s.blockchain.CurrentBlock())
+		case ch := <-s.closeFilterMaps:
+			close(ch)
+			return
+		}
+	}
+}
+
+func (s *Ethereum) setupDiscovery() error {
+	eth.StartENRUpdater(s.blockchain, s.p2pServer.LocalNode())
+
+	// Add eth nodes from DNS.
+	dnsclient := dnsdisc.NewClient(dnsdisc.Config{})
+	if len(s.config.EthDiscoveryURLs) > 0 {
+		iter, err := dnsclient.NewIterator(s.config.EthDiscoveryURLs...)
+		if err != nil {
+			return err
+		}
+		s.discmix.AddSource(iter)
+	}
+
+	// Add snap nodes from DNS.
+	if len(s.config.SnapDiscoveryURLs) > 0 {
+		iter, err := dnsclient.NewIterator(s.config.SnapDiscoveryURLs...)
+		if err != nil {
+			return err
+		}
+		s.discmix.AddSource(iter)
+	}
+
+	// Add DHT nodes from discv4.
+	if s.p2pServer.DiscoveryV4() != nil {
+		iter := s.p2pServer.DiscoveryV4().RandomNodes()
+		resolverFunc := func(ctx context.Context, enr *enode.Node) *enode.Node {
+			// RequestENR does not yet support context. It will simply time out.
+			// If the ENR can't be resolved, RequestENR will return nil. We don't
+			// care about the specific error here, so we ignore it.
+			nn, _ := s.p2pServer.DiscoveryV4().RequestENR(enr)
+			return nn
+		}
+		iter = enode.AsyncFilter(iter, resolverFunc, maxParallelENRRequests)
+		iter = enode.Filter(iter, eth.NewNodeFilter(s.blockchain))
+		iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
+		s.discmix.AddSource(iter)
+	}
+
+	// Add DHT nodes from discv5.
+	if s.p2pServer.DiscoveryV5() != nil {
+		filter := eth.NewNodeFilter(s.blockchain)
+		iter := enode.Filter(s.p2pServer.DiscoveryV5().RandomNodes(), filter)
+		iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
+		s.discmix.AddSource(iter)
+	}
+
+	return nil
+}
+
+// Stop implements node.Lifecycle, terminating all internal goroutines used by the
+// Ethereum protocol.
+func (s *Ethereum) Stop() error {
+	// Stop all the peer-related stuff first.
+	s.discmix.Close()
+	s.dropper.Stop()
+	s.handler.Stop()
+	// Then stop everything else.
+
+	// Then stop everything else.
+	ch := make(chan struct{})
+	s.closeFilterMaps <- ch
+	<-ch
+	s.filterMaps.Stop()
+	s.txPool.Close()
+	s.miner.Close()
+	s.blockchain.Stop()
+	s.engine.Close()
+	if s.seqRPCService != nil {
+		s.seqRPCService.Close()
+	}
+	if s.historicalRPCService != nil {
+		s.historicalRPCService.Close()
+	}
+	if s.slsManager != nil {
+		s.slsManager.Stop()
+	}
+
+	if s.slsCloser != nil {
+		s.slsCloser()
+	}
+
+	// Clean shutdown marker as the last thing before closing db
+	s.shutdownTracker.Stop()
+
+	s.chainDb.Close()
+	s.eventMux.Stop()
+
+	return nil
+}
+
+// SyncMode retrieves the current sync mode, either explicitly set, or derived
+// from the chain status.
+func (s *Ethereum) SyncMode() ethconfig.SyncMode {
+	// If we're in snap sync mode, return that directly
+	if s.handler.snapSync.Load() {
+		return ethconfig.SnapSync
+	}
+	// We are probably in full sync, but we might have rewound to before the
+	// snap sync pivot, check if we should re-enable snap sync.
+	head := s.blockchain.CurrentBlock()
+	if pivot := rawdb.ReadLastPivotNumber(s.chainDb); pivot != nil {
+		if head.Number.Uint64() < *pivot {
+			return ethconfig.SnapSync
+		}
+	}
+	// We are in a full sync, but the associated head state is missing. To complete
+	// the head state, forcefully rerun the snap sync. Note it doesn't mean the
+	// persistent state is corrupted, just mismatch with the head block.
+	if !s.blockchain.HasState(head.Root) {
+		log.Info("Reenabled snap sync as chain is stateless")
+		return ethconfig.SnapSync
+	}
+	// Nope, we're really full syncing
+	return ethconfig.FullSync
+}
