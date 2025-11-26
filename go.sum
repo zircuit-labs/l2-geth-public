@@ -706,7 +706,7 @@ github.com/yuin/goldmark v1.3.5/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
 github.com/yusufpapurcu/wmi v1.2.4 h1:zFUKzehAFReQwLys1b/iSMl+JQGSCSjtVqQn9bBrPo0=
 github.com/yusufpapurcu/wmi v1.2.4/go.mod h1:SBZ9tNy3G9/m5Oi98Zks0QjeHVDvuK0qfxQmPyzfmi0=
-github.com/zircuit-labs/zkr-go-common-public v1.21.2 h1:CAR+rpYGoZtffRygOlvh4p8cF5vGorosr/rYYI0JZVM=
+github.com/zircuit-labs/zkr-go-common-public v1.21.2 h1:yx0Ak8QGCYv0tzh0wX46au1kZu75lVe4x2UKgX/+ctM=
 github.com/zircuit-labs/zkr-go-common-public v1.21.2/go.mod h1:B9O+MHQj0msyEKdLfY1HutbsAS49O4bfaRSRFVQ0Y80=
 go.etcd.io/etcd/api/v3 v3.5.4/go.mod h1:5GB2vv4A4AOn3yk7MftYGHkUfGtDHnEraIjym4dYz5A=
 go.etcd.io/etcd/client/pkg/v3 v3.5.4/go.mod h1:IJHfcCEKxYu1Os13ZdwCwIUTUVGYTSAM3YSwc9/Ac1g=
