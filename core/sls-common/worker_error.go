@@ -7,6 +7,6 @@ type (
 	}
 )
 
-func (s WorkerError) Error() string {
+func (s *WorkerError) Error() string {
 	return "sls worker: block has transactions flagged"
 }

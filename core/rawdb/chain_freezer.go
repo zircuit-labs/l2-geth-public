@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zircuit-labs/l2-geth/common"
@@ -44,6 +45,9 @@ const (
 // feature. The background thread will keep moving ancient chain segments from
 // key-value database to flat files for saving space on live database.
 type chainFreezer struct {
+	// Zircuit addition: this was used in the past but we still need it for testing
+	threshold atomic.Uint64 // Number of recent blocks not to freeze (if 0, params.FullImmutabilityThreshold should be used)
+
 	ancients ethdb.AncientStore // Ancient store for storing cold chain segment
 
 	// Optional Era database used as a backup for the pruned chain.
@@ -138,15 +142,26 @@ func (f *chainFreezer) freezeThreshold(db ethdb.KeyValueReader) (uint64, error) 
 		final     = f.readFinalizedNumber(db)
 		headLimit uint64
 	)
-	if head > params.FullImmutabilityThreshold {
-		headLimit = head - params.FullImmutabilityThreshold
+	threshold := f.threshold.Load()
+	if threshold == 0 {
+		threshold = params.FullImmutabilityThreshold
+	}
+	if head > threshold {
+		headLimit = head - threshold
 	}
 	if final == 0 && headLimit == 0 {
 		return 0, errors.New("freezing threshold is not available")
 	}
-	if final > headLimit {
-		return final, nil
-	}
+	// Zircuit addition: we have a second finality when posting the output root on L1 that
+	// geth doesn't know about. To allow easier intervention in case something goes wrong,
+	// we do not want to freeze the blocks as quickly.
+	// The FullImmutabilityThreshold of 90000 alone works for us since with a block time of
+	// 2s, it's only about 2 days worth of blocks.
+	//
+	// The upstream code:
+	// if final > headLimit {
+	// 	return final, nil
+	// }
 	return headLimit, nil
 }
 

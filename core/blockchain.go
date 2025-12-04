@@ -2177,6 +2177,10 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 		oldChain    []*types.Header
 		commonBlock *types.Header
 	)
+	// Zircuit addition: exit early if both heads are identical
+	if oldHead.Hash() == newHead.Hash() {
+		return nil
+	}
 	// Reduce the longer chain to the same number as the shorter one
 	if oldHead.Number.Uint64() > newHead.Number.Uint64() {
 		// Old chain is longer, gather all transactions and logs as deleted ones

@@ -178,9 +178,7 @@ func (miner *Miner) generateWork(genParam *generateParams) *newPayloadResult {
 
 	misc.EnsureCreate2Deployer(miner.chainConfig, work.header.Time, work.state)
 
-	var (
-		depositExclusionList []common.Hash
-	)
+	var depositExclusionList []common.Hash
 
 	for i, tx := range genParam.txs {
 		// save snapshot for accumulated block limit
@@ -214,7 +212,7 @@ func (miner *Miner) generateWork(genParam *generateParams) *newPayloadResult {
 	if len(depositExclusionList) > 0 {
 		return &newPayloadResult{
 			depositExclusions: depositExclusionList,
-			err:               slsCommon.WorkerError{DepositTransactionsFlagged: true},
+			err:               &slsCommon.WorkerError{DepositTransactionsFlagged: true},
 		}
 	}
 
@@ -443,7 +441,6 @@ func (miner *Miner) prepareWork(genParams *generateParams) (*environment, error)
 
 // makeEnv creates a new environment for the sealing block.
 func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address, witness bool, rpcCtx context.Context, checkTransactions bool) (*environment, error) {
-
 	// Retrieve the parent state to execute on top and start a prefetcher for
 	// the miner to speed block sealing up a bit.
 	state, err := miner.chain.StateAt(parent.Root)
@@ -563,7 +560,6 @@ func (miner *Miner) applyTransaction(env *environment, txM *transactionAndMeta) 
 
 	var receipt *types.Receipt
 	receipt, err = core.ApplyTransaction(env.evm, env.gasPool, env.state, env.header, tx, &env.header.GasUsed)
-
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.SetGas(gp)

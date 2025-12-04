@@ -1831,14 +1831,15 @@ func testRepairWithScheme(t *testing.T, tt *rewindTest, snapshots bool, scheme s
 	}
 	// Force run a freeze cycle
 	type freezer interface {
-		Freeze() error
+		Freeze(uint64) error
 		Ancients() (uint64, error)
 	}
-	if tt.freezeThreshold < uint64(tt.canonicalBlocks) {
-		final := uint64(tt.canonicalBlocks) - tt.freezeThreshold
-		chain.SetFinalized(canonblocks[int(final)-1].Header())
-	}
-	db.(freezer).Freeze()
+	// Zircuit addition: we do not freeze on finalization, so we use a different helper method
+	// if tt.freezeThreshold < uint64(tt.canonicalBlocks) {
+	// 	final := uint64(tt.canonicalBlocks) - tt.freezeThreshold
+	// 	chain.SetFinalized(canonblocks[int(final)-1].Header())
+	// }
+	db.(freezer).Freeze(tt.freezeThreshold)
 
 	// Set the simulated pivot block
 	if tt.pivotBlock != nil {
