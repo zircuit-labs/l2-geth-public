@@ -39,7 +39,6 @@ import (
 	"github.com/zircuit-labs/l2-geth/ethdb"
 	"github.com/zircuit-labs/l2-geth/internal/flags"
 	"github.com/zircuit-labs/l2-geth/log"
-	"github.com/zircuit-labs/l2-geth/metrics"
 	"github.com/zircuit-labs/l2-geth/node"
 )
 
@@ -289,13 +288,11 @@ func importChain(ctx *cli.Context) error {
 	if ctx.Args().Len() < 1 {
 		utils.Fatalf("This command requires an argument.")
 	}
-	// Start metrics export if enabled
-	utils.SetupMetrics(ctx)
-	// Start system runtime metrics collection
-	go metrics.CollectProcessMetrics(3 * time.Second)
-
-	stack, _ := makeConfigNode(ctx)
+	stack, cfg := makeConfigNode(ctx)
 	defer stack.Close()
+
+	// Start metrics export if enabled
+	utils.SetupMetrics(&cfg.Metrics)
 
 	chain, db := utils.MakeChain(ctx, stack, false)
 	defer db.Close()

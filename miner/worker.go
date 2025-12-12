@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +32,6 @@ import (
 	"github.com/zircuit-labs/l2-geth/core"
 	slsCommon "github.com/zircuit-labs/l2-geth/core/sls-common"
 	sls "github.com/zircuit-labs/l2-geth/core/sls-public"
-	"github.com/zircuit-labs/l2-geth/core/sls-public/evmlimiter"
 	"github.com/zircuit-labs/l2-geth/core/state"
 	"github.com/zircuit-labs/l2-geth/core/stateless"
 	"github.com/zircuit-labs/l2-geth/core/txpool"
@@ -194,7 +194,7 @@ func (miner *Miner) generateWork(genParam *generateParams) *newPayloadResult {
 		txM := &transactionAndMeta{tx: tx, mustInclude: mustIncludeTx(work, tx, i)}
 		_, err := miner.commitTransaction(work, txM)
 
-		// check if there is an evm limiter error
+		// check if the error is coming from whalekiller
 		if vm.IsEVMLimitError(err) {
 			// Restore accumulated block limit for deposits
 			if limiter != nil {
@@ -214,7 +214,7 @@ func (miner *Miner) generateWork(genParam *generateParams) *newPayloadResult {
 	if len(depositExclusionList) > 0 {
 		return &newPayloadResult{
 			depositExclusions: depositExclusionList,
-			err:               slsCommon.WorkerError{DepositTransactionsFlagged: true},
+			err:               &slsCommon.WorkerError{DepositTransactionsFlagged: true},
 		}
 	}
 
@@ -473,9 +473,9 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 
 	if checkTransactions {
 		// Only create limiter if enabled (default: enabled)
-		if evmlimiter.WhalekillerLimitsEnabled() {
-			limiterCfg := evmlimiter.BuildLimitConfig()
-			limiter := evmlimiter.NewEVMLimiter(limiterCfg)
+		if disabled := os.Getenv(vm.WhalekillerLimitsDisabledEnv); disabled != "true" && disabled != "1" {
+			limiterCfg := vm.BuildLimitConfig()
+			limiter := vm.NewEVMLimiter(limiterCfg)
 			evm.SetExecutionLimiter(limiter)
 		}
 	}

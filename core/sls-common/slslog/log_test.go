@@ -8,10 +8,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/zircuit-labs/l2-geth/log"
 	zkrlog "github.com/zircuit-labs/zkr-go-common/log"
 	"github.com/zircuit-labs/zkr-go-common/xerrors/stacktrace"
-
-	"github.com/zircuit-labs/l2-geth/log"
 )
 
 var (
@@ -167,7 +166,7 @@ func TestNewCompatibleWithExistingCode(t *testing.T) {
 	buf.Reset()
 
 	// Test case 2: slslog.NewWith()
-	logger2 := NewWith("detector", "example_detector")
+	logger2 := NewWith("detector", "hypernative")
 	logger2.Info("detector message")
 	output = buf.String()
 	if !strings.Contains(output, "detector message") {
@@ -268,7 +267,7 @@ func TestLoggerBackwardCompatibility(t *testing.T) {
 		{
 			name: "detector pattern",
 			fn: func() {
-				logger := NewWith("detector", "example_detector")
+				logger := NewWith("detector", "hypernative")
 				logger.Info("scanning transaction", "tx_hash", "0x123")
 			},
 		},

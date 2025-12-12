@@ -1,7 +1,7 @@
 {
-    "git_commit": "8df6b8e192ded0ca6d711287b26778a2130586ff",
-    "git_date": 1763581999,
+    "git_commit": "63a38ae3e4156aad9b9ff7a81f8b788b36159613",
+    "git_date": 1765301739,
     "git_dirty": false,
-    "version": "v1.101396.1",
+    "version": "v1.101399.5-nov26-hotfix-63a38ae3e",
     "variant": "public"
 }

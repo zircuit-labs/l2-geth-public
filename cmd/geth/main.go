@@ -45,7 +45,6 @@ import (
 	"github.com/zircuit-labs/l2-geth/internal/ethapi"
 	"github.com/zircuit-labs/l2-geth/internal/flags"
 	"github.com/zircuit-labs/l2-geth/log"
-	"github.com/zircuit-labs/l2-geth/metrics"
 	"github.com/zircuit-labs/l2-geth/node"
 )
 
@@ -341,12 +340,6 @@ func prepare(ctx *cli.Context) {
 			ctx.Set(utils.CacheFlag.Name, strconv.Itoa(4096))
 		}
 	}
-
-	// Start metrics export if enabled
-	utils.SetupMetrics(ctx)
-
-	// Start system runtime metrics collection
-	go metrics.CollectProcessMetrics(3 * time.Second)
 
 	if _, ok := os.LookupEnv("DD_APM_ENABLED"); ok {
 		err := profiler.Start(

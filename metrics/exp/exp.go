@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 
+	native_prometheus "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/zircuit-labs/l2-geth/log"
 	"github.com/zircuit-labs/l2-geth/metrics"
 	"github.com/zircuit-labs/l2-geth/metrics/prometheus"
@@ -45,7 +47,7 @@ func Exp(r metrics.Registry) {
 	// http.HandleFunc("/debug/vars", e.expHandler)
 	// haven't found an elegant way, so just use a different endpoint
 	http.Handle("/debug/metrics", h)
-	http.Handle("/debug/metrics/prometheus", prometheus.Handler(r))
+	http.Handle("/debug/metrics/prometheus", combinedPrometheusHandler(r))
 }
 
 // ExpHandler will return an expvar powered metrics handler.
@@ -59,13 +61,43 @@ func ExpHandler(r metrics.Registry) http.Handler {
 func Setup(address string) {
 	m := http.NewServeMux()
 	m.Handle("/debug/metrics", ExpHandler(metrics.DefaultRegistry))
-	m.Handle("/debug/metrics/prometheus", prometheus.Handler(metrics.DefaultRegistry))
+	m.Handle("/debug/metrics/prometheus", combinedPrometheusHandler(metrics.DefaultRegistry))
 	log.Info("Starting metrics server", "addr", fmt.Sprintf("http://%s/debug/metrics", address))
 	go func() {
 		if err := http.ListenAndServe(address, m); err != nil {
 			log.Error("Failure in running metrics server", "err", err)
 		}
 	}()
+}
+
+// combinedPrometheusHandler returns a handler that serves both geth's internal metrics
+// and native Prometheus metrics (e.g., SLS metrics) using promhttp.HandlerFor().
+func combinedPrometheusHandler(r metrics.Registry) http.Handler {
+	// Create native prometheus handler with compression disabled to avoid binary output
+	nativeHandler := promhttp.HandlerFor(
+		native_prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{
+			DisableCompression: true,
+		},
+	)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Capture geth's internal metrics
+		gethRec := &responseRecorder{header: make(http.Header)}
+		prometheus.Handler(r).ServeHTTP(gethRec, req)
+
+		// Capture native Prometheus metrics (SLS metrics, etc.)
+		nativeRec := &responseRecorder{header: make(http.Header)}
+		nativeHandler.ServeHTTP(nativeRec, req)
+
+		// Combine both and write with correct headers
+		combined := append(gethRec.body, nativeRec.body...)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Length", fmt.Sprint(len(combined)))
+		if _, err := w.Write(combined); err != nil {
+			log.Error("failed to write combined metrics", "err", err)
+		}
+	})
 }
 
 func (exp *exp) getInt(name string) *expvar.Int {
@@ -212,3 +244,20 @@ func (exp *exp) syncToExpvar() {
 		}
 	})
 }
+
+// responseRecorder captures HTTP response for combining metrics from multiple handlers
+type responseRecorder struct {
+	header http.Header
+	body   []byte
+}
+
+func (r *responseRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	r.body = append(r.body, b...)
+	return len(b), nil
+}
+
+func (r *responseRecorder) WriteHeader(statusCode int) {}

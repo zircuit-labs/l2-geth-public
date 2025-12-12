@@ -617,6 +617,8 @@ type ChainConfig struct {
 	JavelinaTime *uint64 `json:"javelinaTime,omitempty"` // Javelina switch time (nil = no fork, 0 = already on zircuit)
 	TenrecTime   *uint64 `json:"tenrecTime,omitempty"`   // zkVM + withdrawals switch time (nil = no fork, 0 = already on tenrec)
 
+	WhalekillerLimits *WhalekillerLimitsConfig `json:"whalekillerLimits,omitempty"`
+
 	FjordTime   *uint64 `json:"fjordTime,omitempty"`   // Fjord switch time (nil = no fork, 0 = already on zircuit Fjord)
 	GraniteTime *uint64 `json:"graniteTime,omitempty"` // Granite switch time (nil = no fork, 0 = already on zircuit Granite)
 
@@ -653,6 +655,96 @@ type ChainConfig struct {
 
 	// Scroll config, nil if not active
 	Scroll ScrollConfig `json:"scroll"`
+}
+
+type LimitPair struct {
+	PerTx    uint64 `json:"perTx,omitempty"`
+	PerBlock uint64 `json:"perBlock,omitempty"`
+}
+
+type WhalekillerCycleTracking struct {
+	CallOverhead      uint64 `json:"callOverhead,omitempty"`
+	ThresholdPerTx    uint64 `json:"thresholdPerTx,omitempty"`
+	ThresholdPerBlock uint64 `json:"thresholdPerBlock,omitempty"`
+}
+
+type WhalekillerLimitsConfig struct {
+	Opcodes          map[uint8]LimitPair       `json:"opcodes,omitempty"`
+	Precompiles      map[string]LimitPair      `json:"precompiles,omitempty"`
+	CycleTracking    *WhalekillerCycleTracking `json:"cycleTracking,omitempty"`
+	OpcodeCycles     map[uint8]uint64          `json:"opcodeCycles,omitempty"`
+	PrecompileCycles map[string]uint64         `json:"precompileCycles,omitempty"`
+}
+
+var WhalekillerDefaultLimits = &WhalekillerLimitsConfig{
+	Opcodes: map[uint8]LimitPair{
+		0x09: {PerTx: 21548, PerBlock: 215480}, // MULMOD
+		0x37: {PerTx: 57676, PerBlock: 576767}, // CALLDATACOPY
+		0x44: {PerTx: 83892, PerBlock: 838926}, // DIFFICULTY
+		0x3a: {PerTx: 87275, PerBlock: 872752}, // GASPRICE
+		0x30: {PerTx: 87351, PerBlock: 873515}, // ADDRESS
+		0x41: {PerTx: 87619, PerBlock: 876193}, // COINBASE
+		0x32: {PerTx: 88121, PerBlock: 881212}, // ORIGIN
+		0x5b: {PerTx: 96173, PerBlock: 961732}, // JUMPDEST
+	},
+	Precompiles: map[string]LimitPair{
+		common.BytesToAddress([]byte{0x08}).Hex(): {PerTx: 1, PerBlock: 13},         // BN_PAIR
+		common.BytesToAddress([]byte{0x0a}).Hex(): {PerTx: 10, PerBlock: 105},       // KZG_POINT_EVAL
+		common.BytesToAddress([]byte{0x07}).Hex(): {PerTx: 22, PerBlock: 226},       // BN_MUL
+		common.BytesToAddress([]byte{0x05}).Hex(): {PerTx: 168, PerBlock: 1688},     // MODEXP
+		common.BytesToAddress([]byte{0x06}).Hex(): {PerTx: 811, PerBlock: 8115},     // BN_ADD
+		common.BytesToAddress([]byte{0x01}).Hex(): {PerTx: 2043, PerBlock: 20432},   // ECRECOVER
+		common.BytesToAddress([]byte{0x02}).Hex(): {PerTx: 27519, PerBlock: 275194}, // SHA256
+		common.BytesToAddress([]byte{0x04}).Hex(): {PerTx: 65316, PerBlock: 653167}, // IDENTITY
+	},
+	CycleTracking: &WhalekillerCycleTracking{
+		CallOverhead:      100,
+		ThresholdPerTx:    40_000_000,
+		ThresholdPerBlock: 40_000_000,
+	},
+	OpcodeCycles: map[uint8]uint64{
+		0x40: 300, // BLOCKHASH
+		0x09: 300, // MULMOD
+		0x44: 55,  // DIFFICULTY
+		0x52: 50,  // MSTORE
+		0x3a: 45,  // GASPRICE
+		0x41: 40,  // COINBASE
+		0x30: 40,  // ADDRESS
+		0x32: 40,  // ORIGIN
+		0x51: 40,  // MLOAD
+		0x39: 35,  // CODECOPY
+		0x55: 3,   // SSTORE
+		0x5b: 25,  // JUMPDEST
+		0x20: 20,  // KECCAK256
+		0x5e: 20,  // MCOPY
+		0x54: 2,   // SLOAD
+		0x3f: 15,  // EXTCODEHASH
+		0x3c: 15,  // EXTCODECOPY
+		0x3b: 15,  // EXTCODESIZE
+		0xf5: 5,   // CREATE2
+		0x37: 5,   // CALLDATACOPY
+	},
+
+	PrecompileCycles: map[string]uint64{
+		common.BytesToAddress([]byte{0x01}).Hex():       20,
+		common.BytesToAddress([]byte{0x02}).Hex():       30,
+		common.BytesToAddress([]byte{0x03}).Hex():       15,
+		common.BytesToAddress([]byte{0x04}).Hex():       50,
+		common.BytesToAddress([]byte{0x05}).Hex():       3500,
+		common.BytesToAddress([]byte{0x06}).Hex():       60,
+		common.BytesToAddress([]byte{0x07}).Hex():       80,
+		common.BytesToAddress([]byte{0x08}).Hex():       60,
+		common.BytesToAddress([]byte{0x09}).Hex():       600,
+		common.BytesToAddress([]byte{0x0a}).Hex():       180,
+		common.BytesToAddress([]byte{0x0b}).Hex():       600,
+		common.BytesToAddress([]byte{0x0c}).Hex():       1200,
+		common.BytesToAddress([]byte{0x0d}).Hex():       700,
+		common.BytesToAddress([]byte{0x0e}).Hex():       1750,
+		common.BytesToAddress([]byte{0x0f}).Hex():       1100,
+		common.BytesToAddress([]byte{0x10}).Hex():       1150,
+		common.BytesToAddress([]byte{0x11}).Hex():       850,
+		common.BytesToAddress([]byte{0x01, 0x00}).Hex(): 70, // 0x0100
+	},
 }
 
 // EthashConfig is the consensus engine configs for proof-of-work based sealing.

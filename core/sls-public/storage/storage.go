@@ -24,14 +24,6 @@ func NewStorage(ctx context.Context, config commonStorage.Config) (commonStorage
 	db.SetMaxOpenConns(config.GetDBMaxOpenConns())
 	db.SetMaxIdleConns(config.GetDBMaxIdleConns())
 
-	if err := Migrate(db); err != nil {
-		return nil, err
-	}
-
 	store := NewPostgres(db)
 	return store, store.Ping(ctx) // Return the store and ping the database to check for connectivity.
-}
-
-func Migrate(db *sql.DB) error {
-	panic("This functionality has been intentionally excluded for this release.")
 }
